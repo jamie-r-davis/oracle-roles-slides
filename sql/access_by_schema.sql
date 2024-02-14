@@ -9,38 +9,45 @@ schema : str
 */
 
 
-with schema_roles as (
-  select distinct
-    grantee,
-    owner
-  from dba_tab_privs
-  where
-    owner = :schema
-),
-
-permissions as (
+with permissions as (
+  -- recursively traverse permissions from end-users down to table privileges
   select
-    grantee,
-    granted_role,
-    connect_by_root granted_role as root,
-    substr(sys_connect_by_path(granted_role, '.'), 2) as path
-  from dba_role_privs
-  start with granted_role in (select grantee from schema_roles)
-  connect by granted_role = prior grantee
-),
+    connect_by_root p.grantee as username,
+    p.grantee,
+    p.granted_role,
+    regexp_replace(sys_connect_by_path(p.granted_role, ' > '), '^\W+', '') as permission_path,
+    t.owner as schema,
+    t.table_name
+  from dba_role_privs p
+    left join dba_tab_privs t on
+      p.granted_role = t.grantee and
+      t.owner = :schema
+  connect by p.grantee = prior p.granted_role
+  start with p.grantee in (select username from all_users)
 
-final as (
+  union all
+
+  -- tables that have been directly granted to end-users
   select
-    :schema as schema,
-    a.grantee as username,
-    listagg(distinct a.path, chr(10)) within group (order by a.path) as permissions,
-    listagg(distinct b.table_name, chr(10)) within group (order by b.table_name) as tables
-  from permissions a
-    join dba_tab_privs b on a.root = b.grantee and b.owner = :schema
+    t.grantee as username,
+    t.grantee,
+    null as granted_role,
+    '[Direct Grant]' as permission_path,
+    t.owner as schema,
+    t.table_name
+  from dba_tab_privs t
+    join all_users u on t.grantee = u.username
   where
-    -- only return actual users
-    a.grantee in (select username from all_users)
-  group by :schema, a.grantee
+    t.owner = :schema
 )
 
-select * from final order by username
+select
+  username,
+  listagg(distinct permission_path, chr(10)) within group (order by permission_path) as permissions,
+  schema,
+  listagg(distinct table_name, ', ') within group (order by table_name) as granted_tables
+from permissions s
+where
+  s.table_name is not null
+group by username, schema
+order by username
